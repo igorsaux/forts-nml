@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Forts (lldb)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${config:forts.exe}",
+            "args": [],
+            "cwd": "${config:forts.exeDir}"
+        }
+    ]
+}

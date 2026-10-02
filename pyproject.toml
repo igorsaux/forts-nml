@@ -1,0 +1,18 @@
+[project]
+name = "forts-nml"
+version = "0.1.0"
+description = "Reverse-engineering / modding tooling for Forts 1.38.2-r22447"
+readme = "README.md"
+authors = [
+    { name = "igorsaux", email = "55196698+igorsaux@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "capstone>=5.0.9",
+    "frida-tools>=14.10.4",
+]
+
+# The repo is not a distributable Python package: tools/ holds standalone
+# Frida/PE-analysis scripts that are run directly (see tools/frida/README.md).
+[tool.uv]
+package = false

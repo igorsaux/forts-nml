@@ -1,0 +1,2278 @@
+{
+  "_comment": [
+    "Single source of truth for the game build, the addresses used by the loader,",
+    "and the ABI/hook declarations that tools/frida/gen_zig.py turns into Zig.",
+    "Every object may carry a \"_doc\" string: the generator emits it as a Zig `///`",
+    "doc comment on the corresponding declaration, so documentation travels with",
+    "the data into the generated manifest.",
+    "On a NEW game version: copy this file, update version/sha256, then re-run the",
+    "re-location order in tools/frida/AGENTS.md and replace the RVAs.",
+    "Run `uv run python tools/frida/verify.py --exe <path>` afterwards: it fails",
+    "loudly on any drift. All addresses are RVAs (VA - 0x140000000).",
+    "The schema (types, enums, signatures, structs) and the full struct-field",
+    "type vocabulary -- including what `str`/`count` mean -- are documented in",
+    "tools/frida/AGENTS.md under 'Descriptor schema'. Field types are one of:",
+    "u8/i8/u16/i16/u32/i32/u64/i64/f32/f64/bool/ptr/str/std_vector."
+  ],
+  "game": "Forts",
+  "_doc": "Game build and ABI descriptor for the loader. Addresses, hooks and layouts below are build-specific and must be re-verified for every patch.",
+  "version": "1.38.2-r22447",
+  "module": "Forts.exe",
+  "image_base": "0x140000000",
+  "sha256": "d51b3c821bf7d22796139560038e6853c932e6381b1bb6515b45f2df62d79f0a",
+  "types": [
+    {
+      "name": "Engine",
+      "_doc": "The top-level engine: owns the renderer, input, and the active World through the front-end/back-end factories. Borrowed; never owned by a mod."
+    },
+    {
+      "name": "World",
+      "_doc": "A running match. Constructed when the factory creates ObjectFactoryType.world; owns the simulation (sim at +0x1CB0), teams, managers and the resolved match configuration."
+    },
+    {
+      "name": "WorldSim",
+      "_doc": "The simulation owned by a World (at World+0x1CB0). Owns the fixed-timestep clock (physics at 25 Hz) and drives per-frame/per-step updates."
+    },
+    {
+      "name": "MatchSetup",
+      "_doc": "Match configuration passed to the World constructor: map paths, mission name, commanders, game mode, AI settings and the mod list."
+    },
+    {
+      "name": "FrontEndFactoryStandard",
+      "_doc": "The front-end factory whose first virtual method builds game objects. The object is just { vptr; Engine* owner; } and is not a singleton."
+    },
+    {
+      "name": "FortsShell",
+      "_doc": "The top-level application object (global Shell_ptr). Owns the time keepers, the state stack and the frame loop; its primary vtable (FortsShell_Primary) slot 0 is the per-frame Execute."
+    },
+    {
+      "name": "InputManager",
+      "_doc": "DirectInput8 + Win32 input manager (global InputManager_ptr). Polled once per frame by Input_Update."
+    },
+    {
+      "name": "Renderer",
+      "_doc": "The OpenGL renderer singleton. Its vtable is built at runtime at Renderer_vtable; slot +0x8 is Renderer_Present (glFlush + gdi32 SwapBuffers)."
+    },
+    {
+      "name": "Control",
+      "_doc": "Base UI control of the game's own C++ widget toolkit (see structs.control). Screens are Lua tables built into Control trees; the toolkit is exposed to scripts through the Forts Scripting API's User Interface functions."
+    },
+    {
+      "name": "UiManager",
+      "_doc": "The UI/display manager singleton (global UiManager_ptr). Its +0x28 points at a display object that carries the win32 HWND and the GetClientRect-derived client size used to drive screen layout. This is the root the Lua UI functions resolve controls against."
+    }
+  ],
+  "enums": [
+    {
+      "name": "ObjectFactoryType",
+      "_doc": "Object type ids accepted by ObjectFactory_Create. Non-exhaustive on purpose: the build can add ids and most are unnamed, so any raw u32 remains representable via @enumFromInt. Only `world` is confidently identified.",
+      "base": "c_uint",
+      "values": [
+        {
+          "name": "world",
+          "value": 22,
+          "_doc": "A World; see FnWorldCtor. Size 0x1D18."
+        }
+      ]
+    },
+    {
+      "name": "ControlFrame",
+      "_doc": "Reference frame for the Lua `SetControlFrame` / `worldRelative` UI state. FRAME_SCREEN/FRAME_WORLD/FRAME_CONTEXTMENU are defined in scripts/forts.lua; the value is persistent per script until changed. Controls created with worldRelative=true use FRAME_WORLD.",
+      "base": "c_uint",
+      "values": [
+        { "name": "screen", "value": 0, "_doc": "Screen space (default)." },
+        { "name": "world", "value": 1, "_doc": "World space; positions are relative to world objects." },
+        { "name": "contextmenu", "value": 2, "_doc": "Context-menu frame." }
+      ]
+    }
+  ],
+  "signatures": {
+    "World_Execute": {
+      "_doc": "World::Execute — World vtable slot 3 (offset 0x18). The whole-match update, called once per rendered engine frame with the frame delta. The widest hook: wraps the entire world update.",
+      "ret": "void",
+      "args": [
+        ["this", "*World"],
+        ["delta_seconds", "f32"]
+      ]
+    },
+    "World_Install": {
+      "_doc": "World::Install — World vtable slot 1 (offset 0x8). Activates a freshly constructed world: loads the map, spawns teams/players, and publishes the global World pointer.",
+      "ret": "void",
+      "args": [["this", "*World"]]
+    },
+    "World_RestoredFromPause": {
+      "_doc": "World::RestoredFromPause — World vtable slot 2 (offset 0x10). Runs when the match resumes from a pause. NOTE: on the traced builds this slot is never observed to fire.",
+      "ret": "void",
+      "args": [["this", "*World"]]
+    },
+    "World_DeletingDtor": {
+      "_doc": "World's scalar deleting destructor — World vtable slot 0 (offset 0x0). Destroys the world and, when _flags & 1, frees its storage. Returns `this`, already freed on the deleting path.",
+      "ret": "*World",
+      "args": [
+        ["this", "*World"],
+        ["_flags", "u32"]
+      ]
+    },
+    "World_ctor": {
+      "_doc": "World::World — World constructor. Called by ObjectFactory_Create for ObjectFactoryType.world, with the engine from the factory's owner and the MatchSetup. Returns `this`.",
+      "ret": "*World",
+      "args": [
+        ["this", "*World"],
+        ["engine", "*Engine"],
+        ["setup", "?*MatchSetup"]
+      ]
+    },
+    "World_dtor": {
+      "_doc": "World::~World — the non-deleting destructor. Runs member teardown; the deleting variant (World_DeletingDtor) calls into this and then frees. Not present in the primary vtable.",
+      "ret": "void",
+      "args": [["this", "*World"]]
+    },
+    "World_Sim_Update_Tick": {
+      "_doc": "WorldSim::Update — sim vtable slot 2 (offset 0x10). Advances the simulation for one frame: the fixed-step loop (physics at 25 Hz) and the Lua Update/SystemUpdate dispatch. Good for once-per-frame sim work.",
+      "ret": "void",
+      "args": [
+        ["this", "*WorldSim"],
+        ["delta_seconds", "f32"]
+      ]
+    },
+    "World_Sim_Reset": {
+      "_doc": "WorldSim::Reset — sim vtable slot 1 (offset 0x8). Re-initialises the simulation state (e.g. on a match restart/reload).",
+      "ret": "void",
+      "args": [["this", "*WorldSim"]]
+    },
+    "World_Sim_ctor": {
+      "_doc": "WorldSim::WorldSim — sim constructor. Constructs the simulation owned by `world`. Returns `this`.",
+      "ret": "*WorldSim",
+      "args": [
+        ["this", "*WorldSim"],
+        ["world", "*World"]
+      ]
+    },
+    "World_Sim_dtor": {
+      "_doc": "WorldSim's scalar deleting destructor — sim vtable slot 0 (offset 0x0). Destroys the simulation and, when _flags & 1, frees its storage.",
+      "ret": "*WorldSim",
+      "args": [
+        ["this", "*WorldSim"],
+        ["_flags", "u32"]
+      ]
+    },
+    "ObjectFactory_Create": {
+      "_doc": "FrontEndFactoryStandard::Create — factory vtable slot 0 (offset 0x0). Builds one game object of the requested ty and returns it, or null for unhandled ids. For ty == ObjectFactoryType.world this leads to World_ctor.",
+      "ret": "?*anyopaque",
+      "args": [
+        ["this", "*FrontEndFactoryStandard"],
+        ["ty", "c_uint"],
+        ["setup", "?*MatchSetup"]
+      ]
+    },
+    "FortsShell_Execute": {
+      "_doc": "FortsShell::Execute — FortsShell primary vtable slot 0. The top-level per-frame update: advances the time keepers, polls input (Input_Update), updates the managers, runs the active state frame (Shell_StateFrame) and the FPS limiter. Runs in menus AND in a match, once per rendered frame. This is the app-frame counterpart to World_Sim_Update_Tick.",
+      "ret": "void",
+      "args": [["this", "*FortsShell"]]
+    },
+    "Input_Update": {
+      "_doc": "InputManager::Update — per-frame input poll (DirectInput8 IDirectInputDevice8::GetDeviceState plus Win32 GetKeyState), called from FortsShell_Execute. `this` is the global InputManager_ptr. Hook onEnter to observe or zero the keyboard/mouse state (see structs.input) and so filter gameplay input; the state is copied to the previous-frame snapshot first, then consumed.",
+      "ret": "void",
+      "args": [["this", "*InputManager"]]
+    },
+    "Renderer_Present": {
+      "_doc": "OpenGL present (renderer vtable slot +0x8). Runs once per rendered frame after the game's draw calls and before its glFlush/SwapBuffers; hook onEnter to draw after the game's own UI.",
+      "ret": "void",
+      "args": [["do_swap", "u8"]]
+    },
+    "WndProc": {
+      "_doc": "The main window procedure (window class 'Forts'). The Win32 message hook point: return early to swallow a message. The game reads keyboard/mouse from DirectInput (Input_Update), not WM_KEYDOWN, so also filtering DirectInput is required to stop gameplay input.",
+      "ret": "i64",
+      "args": [
+        ["hwnd", "?*anyopaque"],
+        ["msg", "u32"],
+        ["wparam", "u64"],
+        ["lparam", "i64"]
+      ]
+    },
+    "HUD_Update": {
+      "_doc": "HUD::Update — once per controller per frame. Force PlayerController+0x47 back to 1 in onEnter to keep the DebugPanel open (see structs.playercontroller.debug_overlay).",
+      "ret": "void",
+      "args": [
+        ["this", "?*anyopaque"],
+        ["dt", "f32"]
+      ]
+    },
+    "SoftwareTimeKeeper_ctor": {
+      "_doc": "SoftwareTimeKeeper::SoftwareTimeKeeper — writes the vtable at object+0x0 and zeroes the time at +0x8. Called from the WorldSim ctor with the address WorldSim+0x18C0.",
+      "ret": "void",
+      "args": [["this", "?*anyopaque"]]
+    },
+    "SoftwareTimeKeeper_Set": {
+      "_doc": "SoftwareTimeKeeper vtable slot +0x0: stores the float argument at object+0x8. Hook it to observe/override the per-step time write.",
+      "ret": "void",
+      "args": [
+        ["this", "?*anyopaque"],
+        ["time", "f32"]
+      ]
+    },
+    "SoftwareTimeKeeper_Get": {
+      "_doc": "SoftwareTimeKeeper vtable slot +0x8: returns the float at object+0x8. Read-only accessor the tick uses for scheduled effects / time-limit checks.",
+      "ret": "f32",
+      "args": [["this", "?*anyopaque"]]
+    },
+    "Ui_WidgetFactory": {
+      "_doc": "The UI widget factory: maps a Type string ('Control', 'Button', 'Static', 'StaticWindow', 'Text', 'TextButton', 'EditBox', 'Window', 'WindowFrame', 'ListBox', 'TabbedPanel', 'SliderBar', 'DropDownMenu', 'Graph'; case-insensitive) to a constructor and returns the new control, or null for an unknown type. Per-type allocation sizes are in tools/frida/AGENTS.md.",
+      "ret": "?*anyopaque",
+      "args": [["type_name", "?*anyopaque"]]
+    },
+    "Ui_FindControl": {
+      "_doc": "Control-tree name lookup: returns the control whose name (MSVC std::string at Control+0x128) matches, searching children recursively when `recursive` is nonzero.",
+      "ret": "?*anyopaque",
+      "args": [
+        ["parent", "?*anyopaque"],
+        ["name", "?*anyopaque"],
+        ["recursive", "u8"]
+      ]
+    },
+    "Ui_AddChild": {
+      "_doc": "Appends a child control to a parent (invokes the child's SetParent vtable slot then pushes it onto the parent's children vector).",
+      "ret": "void",
+      "args": [
+        ["parent", "?*anyopaque"],
+        ["child", "?*anyopaque"]
+      ]
+    },
+    "Ui_AddChildFront": {
+      "_doc": "Prepends a child control (drawn-first / front of the children vector).",
+      "ret": "void",
+      "args": [
+        ["parent", "?*anyopaque"],
+        ["child", "?*anyopaque"]
+      ]
+    }
+  },
+  "functions": {
+    "World_Execute": {
+      "rva": "0x1C67D0",
+      "prologue": "48 8b c4 48 89 58 18 48 89 70 20 55 57 41 56 48 8d a8 f8 fe ff ff 48 81 ec f0 01 00 00 0f 29 70",
+      "_doc": "World::Execute (vtable slot 3). See signatures.World_Execute."
+    },
+    "World_Sim_Update_Tick": {
+      "rva": "0x2A9030",
+      "prologue": "4c 8b dc 55 57 49 8d ab 68 ff ff ff 48 81 ec 88 01 00 00 48 8b 05 c6 96 50 00 48 33 c4 48 89 45",
+      "_doc": "WorldSim::Update (sim vtable slot 2). See signatures.World_Sim_Update_Tick."
+    },
+    "Scripts_Update_Dispatch": {
+      "rva": "0xC6320",
+      "prologue": "89 4c 24 08 53 56 57 41 54 41 56 41 57 48 81 ec 88 01 00 00 33 c9 89 8c 24 d0 01 00 00 48 8b 15",
+      "_doc": "Lua script dispatcher (SystemUpdate + Update) run once per fixed step. Not wired to a relay yet."
+    },
+    "Scripts_OnUpdate_Event": {
+      "rva": "0xC69C0",
+      "prologue": "48 89 5c 24 20 f3 0f 11 44 24 08 56 57 41 56 48 81 ec f0 00 00 00 33 db 89 9c 24 20 01 00 00 48",
+      "_doc": "Lua \"OnUpdate\" event, run once per frame. Not wired to a relay yet."
+    },
+    "Scripts_EndFrame": {
+      "rva": "0xC6BA0",
+      "prologue": "48 89 5c 24 10 48 89 6c 24 18 56 57 41 54 41 56 41 57 48 81 ec d0 00 00 00 45 33 f6 44 89 b4 24",
+      "_doc": "Lua end-of-frame bookkeeping. Not wired to a relay yet."
+    },
+    "World_ctor": {
+      "rva": "0x1CFEB0",
+      "prologue": "48 8b c4 48 89 58 20 55 56 57 41 54 41 55 41 56 41 57 48 8d a8 48 f8 ff ff 48 81 ec 90 08 00 00",
+      "_doc": "World::World constructor. See signatures.World_ctor."
+    },
+    "World_dtor": {
+      "rva": "0x1C30E0",
+      "prologue": "48 89 5c 24 10 48 89 74 24 18 48 89 7c 24 20 55 41 54 41 55 41 56 41 57 48 8d ac 24 50 ff ff ff",
+      "_doc": "World::~World non-deleting destructor. See signatures.World_dtor."
+    },
+    "World_DeletingDtor": {
+      "rva": "0x1C41B0",
+      "prologue": "48 89 5c 24 08 57 48 83 ec 20 8b da 48 8b f9 e8 1c ef ff ff f6 c3 01 74 0d ba 18 1d 00 00 48 8b",
+      "_doc": "World scalar deleting destructor (vtable slot 0). See signatures.World_DeletingDtor."
+    },
+    "World_Install": {
+      "rva": "0x1C4250",
+      "prologue": "48 8b c4 48 89 58 18 48 89 68 20 56 57 41 55 41 56 41 57 48 81 ec b0 00 00 00 4c 8b b1 a0 1c 00",
+      "_doc": "World::Install (vtable slot 1). See signatures.World_Install."
+    },
+    "World_RestoredFromPause": {
+      "rva": "0x1BBDC0",
+      "prologue": "40 53 48 83 ec 40 48 8b d9 48 8d 15 c0 e4 54 00 48 8b 0d f9 2d 62 00 e8 c4 5c 26 00 48 8b 8b e0",
+      "_doc": "World::RestoredFromPause (vtable slot 2). See signatures.World_RestoredFromPause."
+    },
+    "World_Sim_ctor": {
+      "rva": "0x2F9E90",
+      "prologue": "48 8b c4 48 89 58 10 48 89 70 18 48 89 78 20 55 41 54 41 55 41 56 41 57 48 8d a8 18 fd ff ff 48",
+      "_doc": "WorldSim::WorldSim constructor. See signatures.World_Sim_ctor."
+    },
+    "World_Sim_Reset": {
+      "rva": "0x2FE480",
+      "prologue": "40 53 48 83 ec 20 33 d2 48 8b d9 e8 a0 fb ff ff 48 8d 8b 08 19 00 00 66 c7 83 d0 10 00 00 00 01",
+      "_doc": "WorldSim::Reset (sim vtable slot 1). See signatures.World_Sim_Reset."
+    },
+    "World_Sim_dtor": {
+      "rva": "0x2FD9A0",
+      "prologue": "48 89 5c 24 08 57 48 83 ec 20 8b da 48 8b f9 e8 2c 00 00 00 f6 c3 01 74 0d ba e0 19 00 00 48 8b",
+      "_doc": "WorldSim scalar deleting destructor (sim vtable slot 0). See signatures.World_Sim_dtor."
+    },
+    "World_Sim_slot18": {
+      "rva": "0x2AA5C0",
+      "prologue": "40 55 56 57 41 56 48 83 ec 78 48 8b f9 44 0f 29 44 24 40 48 8b 0d 56 46 53 00 b2 01 48 8b 01 ff",
+      "_doc": "WorldSim vtable slot 3 (offset 0x18). Purpose not yet established; not wired to a relay."
+    },
+    "ObjectFactory_Create": {
+      "rva": "0x1EA7B0",
+      "prologue": "48 89 5c 24 08 57 48 83 ec 20 49 8b f8 48 8b d9 83 fa 17 0f 87 76 03 00 00 48 63 c2 48 8d 0d 2d",
+      "_doc": "FrontEndFactoryStandard::Create (factory vtable slot 0). See signatures.ObjectFactory_Create."
+    },
+    "FortsShell_Execute": {
+      "rva": "0x7A2A0",
+      "prologue": "48 89 5c 24 18 48 89 6c 24 20 56 57 41 56 48 83 ec 30 0f 29 74 24 20 48 8b f1 48 8b 89 c0 00 00",
+      "_doc": "FortsShell::Execute (FortsShell primary vtable slot 0). Top-level per-frame update; runs in menus and matches. See signatures.FortsShell_Execute."
+    },
+    "Shell_StateFrame": {
+      "rva": "0x7A750",
+      "prologue": "40 53 48 83 ec 20 48 8b d9 b1 01 ff 15 67 99 75 00 48 8b cb e8 97 84 4f 00 48 8b 0d f0 44 76 00",
+      "_doc": "FortsShell primary vtable slot 1. Present + per-frame state tick, invoked from FortsShell_Execute. The real per-frame draw happens here via Renderer_Present."
+    },
+    "App_MainLoop": {
+      "rva": "0x79E60",
+      "prologue": "48 89 5c 24 08 55 56 57 48 81 ec 90 02 00 00 48 8b 05 9a 88 73 00 48 33 c4 48 89 84 24 80 02 00",
+      "_doc": "Top-level application loop (the real WinMain body, after 'Running shell'): pumps PeekMessageW/GetMessageW/TranslateMessage/DispatchMessageW, then calls FortsShell_Execute each iteration. Contains the 'Start Main Loop' / 'End Main Loop' traces. Not itself per-frame (one call per app run); use FortsShell_Execute or Renderer_Present to count frames."
+    },
+    "Input_Update": {
+      "rva": "0x5149A0",
+      "prologue": "40 53 48 83 ec 60 8b 81 c4 0b 00 00 48 8b d9 85 c0 7e 08 ff c8 89 81 c4 0b 00 00 80 79 08 00 0f",
+      "_doc": "InputManager::Update — per-frame input poll (DirectInput8 + GetKeyState). See signatures.Input_Update."
+    },
+    "Renderer_Present": {
+      "rva": "0x517A60",
+      "prologue": "40 53 48 83 ec 20 0f b6 d9 ff 15 a9 3d 16 00 84 db 74 3a 48 8b 0d 0e c9 2b 00 ff 15 e0 40 16 00",
+      "_doc": "OpenGL renderer present: glFlush, and when do_swap != 0 GetDC(hwnd)+SwapBuffers(gdi32)+ReleaseDC, then glClear. Reached once per rendered frame as (*Renderer_vtable[1])(1) from every state's Execute. Not wired to a relay."
+    },
+    "WndProc": {
+      "rva": "0x7EA60",
+      "prologue": "40 53 55 56 57 48 83 ec 48 48 8b 05 a0 3c 73 00 48 33 c4 48 89 44 24 30 49 8b f1 49 8b d8 8b fa",
+      "_doc": "Main window procedure for the 'Forts' window class. Handles WM_CLOSE/WM_DESTROY/WM_SIZE/WM_ACTIVATE/WM_SYSKEYUP/WM_MOUSEWHEEL/WM_IME_*/WM_SIZING/WM_TIMER and routes WM_CHAR/WM_IME_CHAR text to the InputManager (FUN_140514750); everything else to DefWindowProc. See signatures.WndProc."
+    },
+    "LowLevelKeyboardProc": {
+      "rva": "0x71E80",
+      "prologue": "85 c9 75 41 48 8b c2 48 2d 00 01 00 00 74 06 48 83 f8 01 75 1a 80 3d aa a7 76 00 00 74 11 41 8b",
+      "_doc": "WH_KEYBOARD_LL hook proc installed by FUN_140071ee0 via SetWindowsHookExA(13,...) while the window is active, used to catch keys globally (works in exclusive fullscreen). A second keyboard interception point besides DirectInput."
+    },
+    "HUD_Update": {
+      "rva": "0x190210",
+      "prologue": "48 8b c4 55 57 48 8d 68 c8 48 81 ec 28 01 00 00 48 89 58 e8 48 8b f9 4c 89 60 d8 4c 89 70 d0 4c",
+      "_doc": "HUD::Update(HUD* this, float dt), HUD = PlayerController+0xE10. Once per controller per frame; drives the HUD/control tree and calls HUD_DebugPanel + HUD_DebugList. Force PlayerController+0x47 back to 1 in onEnter to keep the DebugPanel open. See signatures.HUD_Update."
+    },
+    "HUD_DebugPanel": {
+      "rva": "0x19C260",
+      "prologue": "4c 8b dc 55 56 49 8d ab c8 fb ff ff 48 81 ec 28 05 00 00 48 8b 05 96 64 61 00 48 33 c4 48 89 85",
+      "_doc": "HUD debug overlay builder. Gated on PlayerController+0x47: when nonzero it shows the DebugPanel (Static) and fills the DebugListBox with live lines via the '%d %d:%02d %.0f fps %S' / 'frame %d cursor %.2f, %.2f' formats. Force PC+0x47=1 here to open DebugPanel in any match."
+    },
+    "HUD_DebugList": {
+      "rva": "0x19CA10",
+      "prologue": "48 8b c4 48 89 58 10 48 89 70 18 48 89 78 20 55 41 54 41 55 41 56 41 57 48 8d 68 a1 48 81 ec e0",
+      "_doc": "Positions/lays out the DebugListBox control (and peers) above the controller's debug overlay region. Called from HUD_Update."
+    },
+    "PlayerController_ctor": {
+      "rva": "0x289E00",
+      "prologue": "48 8b c4 48 89 58 18 55 56 57 41 54 41 55 41 56 41 57 48 81 ec c0 00 00 00 0f 29 70 b8 0f 29 78",
+      "_doc": "PlayerController::PlayerController (size 0xF50). Sets PC+0x47=(World+0x1b64==2) and builds the control tree via PlayerController_CreateHud. Called from World_ctor at World+0x1CE0."
+    },
+    "PlayerController_CreateHud": {
+      "rva": "0x189E10",
+      "prologue": "48 8b c4 48 89 58 20 55 56 57 41 54 41 55 41 56 41 57 48 8d a8 c8 f5 ff ff 48 81 ec 00 0b 00 00",
+      "_doc": "Builds the PlayerController control tree: looks up the root control and resolves named children including DebugPanel (Static), DebugListBox (ListBox), HUDObserver, ObserverPauseButton, Play/Forward/Timeline/SpeedUp/SpeedDown/Speed (the observer player bar), DebugPanel, Movie, Subtitle, HUD, HudPanel."
+    },
+    "Console_BindKeys": {
+      "rva": "0x545A80",
+      "prologue": "48 89 5c 24 08 48 89 74 24 10 57 48 83 ec 40 8b fa 48 8b d9 8b 91 b8 03 00 00 85 d2 74 05 e8 7d",
+      "_doc": "Binds the in-game console keys: ToggleConsole ('~' 0x29), ToggleConsole2 (Enter 0x3D), ToggleConsoleFullscreen ('~'+Shift), Previous/NextCommand, AutoComplete, KeyEnter, KeyBackspace, Paste. Console is a real Console subsystem, separate from the DebugPanel overlay."
+    },
+    "Lua_RegisterApi": {
+      "rva": "0xB1290",
+      "prologue": "48 89 5c 24 08 55 56 57 41 56 41 57 48 8d ac 24 40 42 ff ff b8 c0 be 00 00 e8 32 b2 39 00 48 2b",
+      "_doc": "Registers the entire Forts Lua API (594 C functions) into the script manager's lua_State (FUN_140066d00(manager) = *(manager+0x228)). Each binding is an inline block: public name + '_Name' + C function pointer + arity flag; installed through Lua_InstallBinding. The global byte DAT_1407dd684 selects direct public-name binding (0) versus '_Name' plus an auto-generated Lua LogCall wrapper (nonzero). Called by each script-type initializer (mission/mod/AI). See signatures.Lua_RegisterApi."
+    },
+    "Lua_InstallBinding": {
+      "rva": "0x4E3D00",
+      "prologue": "40 55 57 41 55 41 57 48 83 ec 48 4c 8b 51 20 45 8b f9 4d 8b e8 48 8b fa 48 8b e9 4d 85 d2 0f 84",
+      "_doc": "The generic binding installer: (refObject, name, trampoline, nupvalues, ...). Internally lua_pushcclosure + lua_setfield. Wraps the real C function pointer as a single upvalue carried by a per-signature trampoline (e.g. FUN_1400e3510). Use this to add a new native function to a script state: get the lua_State, call with your lua_CFunction."
+    },
+    "Script_ContextPush": {
+      "rva": "0x900F0",
+      "prologue": "40 57 48 83 ec 20 48 83 3d ea e1 74 00 00 48 8b f9 75 08 32 c0 48 83 c4 20 5f c3 48 89 5c 24 30",
+      "_doc": "ScriptContext push(name): pushes the current script/event context (sets the global CurrentScriptName and appends to ScriptContextQueue, max depth 10). Powers GetCurrentScript/GetCurrentCall; called by every event dispatcher."
+    },
+    "Script_Dofile": {
+      "rva": "0x3E3E70",
+      "prologue": "40 57 48 81 ec 60 01 00 00 48 8b 05 90 e8 3c 00 48 33 c4 48 89 84 24 50 01 00 00 48 83 3d c5 a4",
+      "_doc": "The scripts' dofile(): loads and executes a Lua chunk in LuaCurrentState. Only valid at initialisation; after scripts/forts.lua succeeds it also loads scripts/forts_dlc3.lua. On error logs 'Error: executing dofile %s: %s'."
+    },
+    "Lua_CallScript": {
+      "rva": "0x92180",
+      "prologue": "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8d ac 24 58 fc ff ff 48 81 ec a8 04 00 00 48 8b 05 6d",
+      "_doc": "C implementation of the Lua CallScript(name, teamId, func, args...) binding: finds the named script and calls a function in it. Errors via 'Error: %s:%s Callscript(...) -> %s:%s: %s'."
+    },
+    "Lua_ExecuteInScript": {
+      "rva": "0x91180",
+      "prologue": "4d 85 c0 0f 84 e1 01 00 00 4c 8b dc 55 56 41 56 48 81 ec 70 01 00 00 48 8b 05 72 15 72 00 48 33",
+      "_doc": "C implementation of the Lua ExecuteInScript(teamId, script, instruction) binding."
+    },
+    "Lua_SendScriptEvent": {
+      "rva": "0x91370",
+      "prologue": "48 83 ec 38 c6 44 24 20 00 e8 62 5d 03 00 48 83 c4 38 c3 cc cc cc cc cc cc cc cc cc cc cc cc cc",
+      "_doc": "C implementation (thin wrapper) of the Lua SendScriptEvent(...) binding; dispatches a named event to scripts. Forwards to FUN_1400c70e0."
+    },
+    "Lua_GetScriptValue": {
+      "rva": "0x915F0",
+      "prologue": "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8d ac 24 c8 fd ff ff 48 81 ec 38 03 00 00 48 8b 05 fd",
+      "_doc": "C implementation of the Lua GetScriptValue binding (read a value from another script's data)."
+    },
+    "Lua_SetScriptValue": {
+      "rva": "0x91F80",
+      "prologue": "40 53 55 56 57 41 54 41 55 41 56 41 57 48 81 ec e8 02 00 00 48 8b 05 75 07 72 00 48 33 c4 48 89",
+      "_doc": "C implementation of the Lua SetScriptValue binding (write a value into another script's data)."
+    },
+    "SoftwareTimeKeeper_ctor": {
+      "rva": "0x50DE10",
+      "prologue": "40 53 48 83 ec 20 48 8d 05 db 13 19 00 0f 57 c9 48 89 01 48 8b d9 e8 75 01 ef ff 48 8b c3 48 83",
+      "_doc": "SoftwareTimeKeeper ctor: *this = &SoftwareTimeKeeper::vftable (0x14069F1F8); this->time = 0.0f. See signatures.SoftwareTimeKeeper_ctor."
+    },
+    "SoftwareTimeKeeper_Set": {
+      "rva": "0x3FDFA0",
+      "prologue": "f3 0f 11 49 08 c3",
+      "_doc": "SoftwareTimeKeeper::Set (vtable slot +0x0): MOVSS [rcx+8], xmm1. See signatures.SoftwareTimeKeeper_Set."
+    },
+    "SoftwareTimeKeeper_Get": {
+      "rva": "0x2769F0",
+      "prologue": "f3 0f 10 41 08 c3",
+      "_doc": "SoftwareTimeKeeper::Get (vtable slot +0x8): MOVSS xmm0, [rcx+8]. See signatures.SoftwareTimeKeeper_Get."
+    },
+    "Ui_WidgetFactory": {
+      "rva": "0x54FA20",
+      "prologue": "48 89 5c 24 08 48 89 74 24 18 57 48 83 ec 40 0f 29 74 24 30 48 8b d9 41 b8 20 00 00 00 48 8d 15",
+      "_doc": "UiWidgetFactory(const char* Type) -> Control*. Case-insensitive Type dispatch. Allocates and constructs one of Control/Button/Graph/Static/StaticWindow/Text/TextButton/EditBox/Window(BorderedWindow)/WindowFrame/ListBox/TabbedPanel/SliderBar/DropDownMenu. See signatures.Ui_WidgetFactory."
+    },
+    "Ui_BuildFromLua": {
+      "rva": "0x550DF0",
+      "prologue": "48 89 5c 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8d 6c 24 d9 48 81 ec a0 00 00 00 48 8b 05 fd",
+      "_doc": "Builds a UI control/screen object graph from a Lua chunk and (when requested) loads the sibling strings.lua. Returns the new screen object or null. Called by the engine's screen ctors and by Ui_LoadControl. Not wired to a relay."
+    },
+    "Lua_LoadFile": {
+      "rva": "0x3E4230",
+      "prologue": "40 53 55 56 57 41 54 41 55 41 56 41 57 48 81 ec a8 01 00 00 48 8b 05 c5 e4 3c 00 48 33 c4 48 89",
+      "_doc": "Lua_LoadFile(session, path, keepGlobals, customLoader, fromMemory, flag): loads and runs a Lua file through the pack-aware virtual filesystem (Lua 5.1.1 / LuaPlus) into a script state. Sandboxes the environment: strips and restores loadfile/require/module/package and gates globals; logs 'Error loading file %s: %s'. Anchor for the script-file loading path."
+    },
+    "Ui_FindControl": {
+      "rva": "0x55B060",
+      "prologue": "48 89 5c 24 08 48 89 74 24 10 57 48 83 ec 20 80 b9 48 01 00 00 00 45 0f b6 d8 48 8b f2 48 8b d9",
+      "_doc": "Recursive control name lookup. name lives at Control+0x128 (MSVC std::string), children vector at Control+0xD0. See signatures.Ui_FindControl."
+    },
+    "Ui_AddChild": {
+      "rva": "0x559EA0",
+      "prologue": "48 89 5c 24 08 48 89 74 24 18 48 89 54 24 10 57 48 83 ec 20 48 8b 02 48 8b fa 48 8b f1 48 8b d1",
+      "_doc": "Append a child control. See signatures.Ui_AddChild."
+    },
+    "Ui_AddChildFront": {
+      "rva": "0x559F50",
+      "prologue": "48 89 5c 24 10 48 89 74 24 18 57 48 83 ec 20 48 8b 02 48 8b f2 48 8b f9 48 8b d1 48 8b ce ff 50",
+      "_doc": "Prepend a child control. See signatures.Ui_AddChildFront."
+    },
+    "Ui_CenterOnDesignSize": {
+      "rva": "0x55A360",
+      "prologue": "48 8b 05 91 48 28 00 48 8b 50 28 48 8b 01 f3 0f 10 52 70 f3 0f 10 4a 6c f3 0f 5c 15 6c 03 1d 00",
+      "_doc": "Centres a screen root on the 1066.67x600 design canvas using the display object at UiManager_ptr+0x28 (client width/height at +0x6C/+0x70)."
+    },
+    "Ui_LoadControl": {
+      "rva": "0x94A50",
+      "prologue": "48 89 5c 24 18 48 89 74 24 20 57 48 81 ec 80 02 00 00 48 8b 05 a7 dc 71 00 48 33 c4 48 89 84 24",
+      "_doc": "Lua LoadControl(filename, parent): loads a control tree from a ui/**/*.lua file and adds it under the named parent control (empty = active screen root). For OnControlActivated to fire for its Button/TextButton controls, call SetButtonCallback on each."
+    },
+    "Ui_AddTextControl": {
+      "rva": "0x94C60",
+      "prologue": "40 53 55 56 57 41 54 41 55 41 56 41 57 48 83 ec 78 48 8b 05 98 da 71 00 48 33 c4 48 89 44 24 60",
+      "_doc": "Lua AddTextControl(parent, name, text, anchor, pos, worldRelative, style): creates a Text control (factory alloc 0x880)."
+    },
+    "Ui_AddTextButtonControl": {
+      "rva": "0x94E60",
+      "prologue": "40 53 55 56 57 41 54 41 55 41 56 41 57 48 81 ec 98 00 00 00 48 8b 05 95 d8 71 00 48 33 c4 48 89",
+      "_doc": "Lua AddTextButtonControl(parent, name, text, anchor, pos, worldRelative, style): creates a TextButton (alloc 0x930). OnControlActivated fires when pressed (no SetButtonCallback needed)."
+    },
+    "Ui_AddButtonControl": {
+      "rva": "0x95080",
+      "prologue": "48 89 6c 24 10 48 89 74 24 18 57 48 83 ec 60 f6 05 36 85 74 00 02 41 8b f9 49 8b f0 48 8b ea 4c",
+      "_doc": "Lua AddButtonControl(parent, name, sprite, anchor, size, pos, style): creates a textured Button (alloc 0x3E8). OnControlActivated fires when pressed."
+    },
+    "Ui_AddSpriteControl": {
+      "rva": "0x951E0",
+      "prologue": "48 89 6c 24 18 48 89 74 24 20 41 56 48 83 ec 60 f6 05 d5 83 74 00 02 41 8b f1 49 8b e8 4c 8b f2",
+      "_doc": "Lua AddSpriteControl(parent, name, sprite, anchor, size, pos, worldRelative): creates a Sprite control (Static/Graph variant)."
+    },
+    "Ui_ControlExists": {
+      "rva": "0x952C0",
+      "prologue": "48 83 ec 28 44 8b 05 0d 83 74 00 e8 30 ed ff ff 48 85 c0 0f 95 c0 48 83 c4 28 c3 cc cc cc cc cc",
+      "_doc": "Lua ControlExists(parent, name): true when a control with that name exists under parent."
+    },
+    "Ui_SetButtonCallback": {
+      "rva": "0x95500",
+      "prologue": "40 53 48 83 ec 20 f6 05 bf 80 74 00 02 41 8b d8 74 2d 44 8b 05 bf 80 74 00 e8 e2 ea ff ff 48 85",
+      "_doc": "Lua SetButtonCallback(parent, name, int id): sets the numerical activation id on a control so it dispatches OnControlActivated. Required for Button/TextButton controls that came from LoadControl; AddButtonControl/AddTextButtonControl already dispatch. Installs an ICallbackTarget object (vtable PTR_vftable_1407c33b0) on the control."
+    },
+    "Ui_SetControlText": {
+      "rva": "0x955B0",
+      "prologue": "40 57 48 83 ec 50 f6 05 0f 80 74 00 02 49 8b f8 0f 84 be 00 00 00 44 8b 05 0b 80 74 00 48 89 5c",
+      "_doc": "Lua SetControlText(parent, name, text): sets a Text/TextButton's content and re-evaluates dynamic layout under parent ('$id' prefixes a localised string). Also the C implementation shared by SetControlStyle/SetControlFrame/... helpers."
+    },
+    "Ui_GetChildCount": {
+      "rva": "0x94100",
+      "prologue": "48 83 ec 28 8b 15 ce 94 74 00 4c 8b d1 48 8b 0d cc a1 74 00 48 8b 81 e0 1c 00 00 4c 8b 88 10 0e",
+      "_doc": "Lua GetChildCount(name): number of direct children of a control."
+    },
+    "Ui_GetChildName": {
+      "rva": "0x941C0",
+      "prologue": "48 89 5c 24 08 57 48 83 ec 20 44 8b 05 07 94 74 00 4c 8b c9 48 8b 0d 05 a1 74 00 8b fa 48 8b 81",
+      "_doc": "Lua GetChildName(name, index): name of the nth child control."
+    },
+    "Ui_EvaluateLayoutScript": {
+      "rva": "0x946C0",
+      "prologue": "48 83 ec 28 80 3d 72 81 74 00 00 75 09 f6 05 f8 8e 74 00 02 74 24 44 8b 05 fb 8e 74 00 e8 1e f9",
+      "_doc": "Lua EvaluateLayoutScript(parent, name, expression): evaluates a ScriptX/ScriptY/ScriptW/ScriptH layout mini-expression (e.g. 'MiddleX - MainPanel.x', 'ParentMiddleX', 'PrevVisibleSiblingBottom + 4')."
+    },
+    "Ui_ShowControl": {
+      "rva": "0x96150",
+      "prologue": "40 53 48 83 ec 20 f6 05 6f 74 74 00 02 41 0f b6 d8 74 26 44 8b 05 6e 74 74 00 e8 91 de ff ff 48",
+      "_doc": "Lua ShowControl(parent, name, bool): shows/hides a control."
+    },
+    "Ui_DeleteControl": {
+      "rva": "0x96190",
+      "prologue": "40 53 48 83 ec 20 80 3d a0 66 74 00 00 48 8b da 75 09 f6 05 23 74 74 00 02 74 4b 44 8b 05 26 74",
+      "_doc": "Lua DeleteControl(parent, name): destroys a control."
+    },
+    "Ui_WorldToScreen": {
+      "rva": "0xB0460",
+      "prologue": "40 53 48 83 ec 20 48 8b 05 73 de 72 00 48 8b d9 4c 8b c2 48 8b d3 48 8b 88 d0 1c 00 00 48 8b 41",
+      "_doc": "Lua WorldToScreen(pos): world position -> screen position."
+    },
+    "Ui_ScreenToWorld": {
+      "rva": "0xB04A0",
+      "prologue": "40 53 48 83 ec 20 48 8b 05 33 de 72 00 48 8b d9 4c 8b c2 48 8b d3 48 8b 88 d0 1c 00 00 48 8b 41",
+      "_doc": "Lua ScreenToWorld(pos): screen position -> world position."
+    }
+  },
+  "vtables": {
+    "World": {
+      "rva": "0x70C598",
+      "_doc": "World vtable base. Slots: 0 deleting dtor, 1 Install, 2 RestoredFromPause, 3 Execute.",
+      "slots": [
+        {
+          "offset": "0x00",
+          "function": "World_DeletingDtor",
+          "_doc": "Scalar deleting destructor."
+        },
+        {
+          "offset": "0x08",
+          "function": "World_Install",
+          "_doc": "Install/activate the world."
+        },
+        {
+          "offset": "0x10",
+          "function": "World_RestoredFromPause",
+          "_doc": "Resume after pause."
+        },
+        {
+          "offset": "0x18",
+          "function": "World_Execute",
+          "_doc": "Per-frame whole-world update."
+        }
+      ]
+    },
+    "WorldSim_primary": {
+      "rva": "0x71D038",
+      "_doc": "WorldSim primary vtable. Slots: 0 deleting dtor, 1 Reset, 2 Update, 3 unknown.",
+      "slots": [
+        {
+          "offset": "0x00",
+          "function": "World_Sim_dtor",
+          "_doc": "Scalar deleting destructor."
+        },
+        {
+          "offset": "0x08",
+          "function": "World_Sim_Reset",
+          "_doc": "Re-initialise sim state."
+        },
+        {
+          "offset": "0x10",
+          "function": "World_Sim_Update_Tick",
+          "_doc": "Advance one frame."
+        },
+        {
+          "offset": "0x18",
+          "function": "World_Sim_slot18",
+          "_doc": "Unidentified slot."
+        }
+      ]
+    },
+    "WorldSim_secondary": {
+      "rva": "0x71D008",
+      "_doc": "WorldSim secondary vtable (known by RVA only; targets not yet identified).",
+      "slots": [
+        { "offset": "0x00", "rva": "0x2E87D0", "_doc": "Unknown." },
+        { "offset": "0x08", "rva": "0x2F8280", "_doc": "Unknown." },
+        { "offset": "0x10", "rva": "0x2C5530", "_doc": "Unknown." },
+        { "offset": "0x18", "rva": "0x2C5790", "_doc": "Unknown." }
+      ]
+    },
+    "FortsShell_Primary": {
+      "rva": "0x6E0598",
+      "_doc": "FortsShell primary vtable (installed at object+0x0 by FortsShell ctor). Slots: 0 Execute (per-frame), 1 state frame/present, 2 unidentified Shell method @0x572BC0.",
+      "slots": [
+        {
+          "offset": "0x00",
+          "function": "FortsShell_Execute",
+          "_doc": "Top-level per-frame update (menus and match)."
+        },
+        {
+          "offset": "0x08",
+          "function": "Shell_StateFrame",
+          "_doc": "Per-frame state tick + present."
+        },
+        {
+          "offset": "0x10",
+          "rva": "0x572BC0",
+          "_doc": "Unidentified Shell method."
+        }
+      ]
+    },
+    "SoftwareTimeKeeper_Primary": {
+      "rva": "0x69F1F8",
+      "_doc": "SoftwareTimeKeeper primary vtable. Base class TimeKeeper. Slot +0x0 stores the float time, slot +0x8 returns it; the WorldSim tick calls Get and Set through the embedded clock at WorldSim+0x18C0.",
+      "slots": [
+        {
+          "offset": "0x00",
+          "function": "SoftwareTimeKeeper_Set",
+          "_doc": "Set: store the float time at object+0x8."
+        },
+        {
+          "offset": "0x08",
+          "function": "SoftwareTimeKeeper_Get",
+          "_doc": "Get: return the float time at object+0x8."
+        }
+      ]
+    }
+  },
+  "strings": {
+    "SystemUpdate": {
+      "rva": "0x6FA4A8",
+      "text": "SystemUpdate",
+      "_doc": "Lua SystemUpdate hook name."
+    },
+    "Update": {
+      "rva": "0x6FA524",
+      "text": "Update",
+      "_doc": "Lua Update hook name."
+    },
+    "OnUpdate": {
+      "rva": "0x6FA588",
+      "text": "OnUpdate",
+      "_doc": "Lua OnUpdate event name."
+    },
+    "EXECTIME_UpdateScript": {
+      "rva": "0x6FA530",
+      "text": "%d EXECTIME UpdateScript %s %f",
+      "_doc": "Script timing trace format."
+    },
+    "illegal_globals": {
+      "rva": "0x6FA4C0",
+      "text": "%d: illegal use of globals",
+      "_doc": "Lua sandbox diagnostic."
+    },
+    "World_object_installed": {
+      "rva": "0x70B070",
+      "text": "World object installed",
+      "_doc": "Emitted by World_Install."
+    },
+    "World_restored_from_pause": {
+      "rva": "0x70A290",
+      "text": "World object restored from pause",
+      "_doc": "Emitted by World_RestoredFromPause."
+    },
+    "World_Execute_mDone": {
+      "rva": "0x70B2E0",
+      "text": "World::Execute mDone detected",
+      "_doc": "Match-done trace in World_Execute."
+    },
+    "physics_clock": {
+      "rva": "0x70AEB8",
+      "text": "Starting physics clock at frame %d, time %.4f",
+      "_doc": "Sim clock start trace."
+    },
+    "OnGameStart": {
+      "rva": "0x6FC0A8",
+      "text": "OnGameStart",
+      "_doc": "Lua game-start event name."
+    },
+    "GetConstant_underscored": {
+      "rva": "0x6F3E90",
+      "text": "_GetConstant",
+      "_doc": "Lua global accessor (underscored)."
+    },
+    "GetConstant": {
+      "rva": "0x6F3EA0",
+      "text": "GetConstant",
+      "_doc": "Lua global accessor."
+    },
+    "EnableAI_underscored": {
+      "rva": "0x6F3C50",
+      "text": "_EnableAI",
+      "_doc": "Lua AI toggle (underscored)."
+    },
+    "EnableAI": {
+      "rva": "0x6F3C60",
+      "text": "EnableAI",
+      "_doc": "Lua AI toggle."
+    },
+    "MainLoop_Start": {
+      "rva": "0x6E0268",
+      "text": "--------------------- Start Main Loop ---------------------",
+      "_doc": "Main-loop start trace in App_MainLoop."
+    },
+    "Running_shell": {
+      "rva": "0x6DAC80",
+      "text": "Running shell",
+      "_doc": "Emitted by WinMain right before App_MainLoop."
+    },
+    "Renderer_CreatingContext": {
+      "rva": "0x69FAE0",
+      "text": "Creating context",
+      "_doc": "Emitted by the OpenGL renderer init (Renderer_Init)."
+    },
+    "Renderer_VideoCard": {
+      "rva": "0x69FBA8",
+      "text": "video card model: %s",
+      "_doc": "Emitted by renderer init with glGetString(GL_RENDERER)."
+    },
+    "WM_CLOSE_trace": {
+      "rva": "0x6E0960",
+      "text": "WM_CLOSE",
+      "_doc": "Emitted by WndProc on WM_CLOSE."
+    },
+    "WndProc_AltIntercept": {
+      "rva": "0x6E0970",
+      "text": "intercepted WM_SYSKEYUP - VK_MENU",
+      "_doc": "Emitted by WndProc when it swallows the Alt-key system message."
+    },
+    "Vulkan_check": {
+      "rva": "0x6A18E8",
+      "text": "Check for and load vulkan-1.dll",
+      "_doc": "Emitted by the renderer when probing the optional Vulkan backend (GL_NV_draw_vulkan_image interop). Anchor only; the Vulkan path is not modelled."
+    },
+    "DebugPanel": {
+      "rva": "0x707A60",
+      "text": "DebugPanel",
+      "_doc": "Name of the Static control that holds the debug overlay text; looked up by PlayerController_CreateHud and shown by PlayerController_DebugPanel."
+    },
+    "DebugListBox": {
+      "rva": "0x707A48",
+      "text": "DebugListBox",
+      "_doc": "Name of the ListBox control that lists the live debug lines (mod activation, sim frame, etc.)."
+    },
+    "ToggleDebugMode": {
+      "rva": "0x6DC530",
+      "text": "ToggleDebugMode",
+      "_doc": "A config/action name for toggling debug mode (no code xref; likely a console/config key)."
+    },
+    "DebugPanel_fps": {
+      "rva": "0x708E30",
+      "text": "%d %d:%02d %.0f fps %S",
+      "wide": true,
+      "_doc": "DebugPanel line format (wide string): sim frame, mm:ss, fps, and the current speed as 'Nx' (the %S is the time keeper speed slot). This is where the game speed is displayed in the UI."
+    },
+    "DebugPanel_cursor": {
+      "rva": "0x708E60",
+      "text": "frame %d cursor %.2f, %.2f",
+      "wide": true,
+      "_doc": "Second DebugPanel line (wide string), shown when the controller flag at PlayerController+0x53 is set."
+    },
+    "IllegalGlobals": {
+      "rva": "0x6FA4C0",
+      "text": "%d: illegal use of globals in %s, state should only be stored in the 'data' table to avoid desyncs",
+      "_doc": "Script state guard: emitted by Scripts_Update_Dispatch when a script's global table grew, i.e. it stored state outside its 'data' table (which desyncs late joiners/replay seeks)."
+    },
+    "DofileAtInit": {
+      "rva": "0x728330",
+      "text": "Error: executing dofile %s at run time; dofile must run at initialisation",
+      "_doc": "Emitted by Script_Dofile when a script calls the engine dofile() after initialisation."
+    },
+    "ScriptCtxMaxDepth": {
+      "rva": "0x6F2FB0",
+      "text": "Error attempting to push script context (%s): ScriptContext queue has exceeded maximum depth",
+      "_doc": "Emitted by Script_ContextPush when the ScriptContext queue (max depth 10) overflows, i.e. script->script recursion is too deep."
+    },
+    "ScriptsFortsLua": {
+      "rva": "0x70B108",
+      "text": "scripts/forts.lua",
+      "_doc": "The Lua bootstrap every script dofile()s; Script_Dofile chains scripts/forts_dlc3.lua after it."
+    },
+    "FortsLua": {
+      "rva": "0x6E01C0",
+      "text": "forts.lua",
+      "_doc": "Bare forts.lua name (Lua-side helpers such as ScheduleCall are defined here)."
+    },
+    "LogWrapperTemplate": {
+      "rva": "0x6F3B90",
+      "text": "%s = function(...) LogCall(\"%s%s) return _%s(unpack(arg)) end",
+      "_doc": "Template used by Lua_RegisterApi when DAT_1407dd684 is nonzero: generates a Lua LogCall wrapper around each '_Name' native binding."
+    },
+    "CallScriptError": {
+      "rva": "0x6F3228",
+      "text": "Error: %s:%s Callscript(\"%s\", %d, \"%s\") -> %s:%s: %s",
+      "_doc": "Emitted by Lua_CallScript when a cross-script call raises."
+    },
+    "ScriptContext": {
+      "rva": "0x6F2FB0",
+      "text": "Error attempting to push script context",
+      "_doc": "Prefix anchor for the ScriptContext subsystem."
+    },
+    "LuaApi_LoadControl": {
+      "rva": "0x6F43D8",
+      "text": "LoadControl",
+      "_doc": "Lua UI API binding name (pair with _LoadControl at 0x6F43C8)."
+    },
+    "LuaApi_AddTextControl": {
+      "rva": "0x6F43F8",
+      "text": "AddTextControl",
+      "_doc": "Lua UI API binding name (pair with _AddTextControl at 0x6F43E8)."
+    },
+    "LuaApi_AddTextButtonControl": {
+      "rva": "0x6F4420",
+      "text": "AddTextButtonControl",
+      "_doc": "Lua UI API binding name (pair with _AddTextButtonControl at 0x6F4408)."
+    },
+    "LuaApi_AddContextButton": {
+      "rva": "0x6F4848",
+      "text": "AddContextButton",
+      "_doc": "Lua UI API binding name (pair with _AddContextButton at 0x6F4830)."
+    },
+    "LuaApi_SetControlFrame": {
+      "rva": "0x6F4540",
+      "text": "SetControlFrame",
+      "_doc": "Lua UI API binding name (the SetControl* family spans 0x6F4528..0x6F4A80)."
+    },
+    "LuaApi_SetControlRelativePos": {
+      "rva": "0x6F45F0",
+      "text": "SetControlRelativePos",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlAbsolutePos": {
+      "rva": "0x6F4620",
+      "text": "SetControlAbsolutePos",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlLayoutX": {
+      "rva": "0x6F4650",
+      "text": "SetControlLayoutX",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlLayoutY": {
+      "rva": "0x6F4680",
+      "text": "SetControlLayoutY",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlLayoutW": {
+      "rva": "0x6F46B0",
+      "text": "SetControlLayoutW",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlLayoutH": {
+      "rva": "0x6F46E0",
+      "text": "SetControlLayoutH",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlSize": {
+      "rva": "0x6F4758",
+      "text": "SetControlSize",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlStyle": {
+      "rva": "0x6F4780",
+      "text": "SetControlStyle",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlProgress": {
+      "rva": "0x6F47D0",
+      "text": "SetControlProgress",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlText": {
+      "rva": "0x6F47F8",
+      "text": "SetControlText",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlTextW": {
+      "rva": "0x6F4820",
+      "text": "SetControlTextW",
+      "_doc": "Lua UI API binding name (wide-character variant)."
+    },
+    "LuaApi_SetControlSprite": {
+      "rva": "0x6F48C0",
+      "text": "SetControlSprite",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlSpriteByParent": {
+      "rva": "0x6F48F8",
+      "text": "SetControlSpriteByParent",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlColour": {
+      "rva": "0x6F4A50",
+      "text": "SetControlColour",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_SetControlAlpha": {
+      "rva": "0x6F4A80",
+      "text": "SetControlAlpha",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_GetControlFrame": {
+      "rva": "0x6F4568",
+      "text": "GetControlFrame",
+      "_doc": "Lua UI API binding name (the GetControl* family spans 0x6F4550..0x6F47A8 plus 0x6FBCD0..)."
+    },
+    "LuaApi_GetControlRelativePos": {
+      "rva": "0x6F4590",
+      "text": "GetControlRelativePos",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_GetControlAbsolutePos": {
+      "rva": "0x6F45C0",
+      "text": "GetControlAbsolutePos",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_GetControlSize": {
+      "rva": "0x6F4738",
+      "text": "GetControlSize",
+      "_doc": "Lua UI API binding name."
+    },
+    "LuaApi_GetControlStyle": {
+      "rva": "0x6F47A8",
+      "text": "GetControlStyle",
+      "_doc": "Lua UI API binding name."
+    },
+    "UiType_control": {
+      "rva": "0x69BA28",
+      "text": "control",
+      "_doc": "Widget factory Type string (case-insensitive). Factory compares it first; see Ui_WidgetFactory."
+    },
+    "UiType_button": {
+      "rva": "0x6A4DE8",
+      "text": "button",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_static": {
+      "rva": "0x6A4DF0",
+      "text": "static",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_staticwindow": {
+      "rva": "0x6A4DF8",
+      "text": "staticwindow",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_text": {
+      "rva": "0x6A4E08",
+      "text": "text",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_textbutton": {
+      "rva": "0x6A4E10",
+      "text": "textbutton",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_editbox": {
+      "rva": "0x6A4E20",
+      "text": "editbox",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_window": {
+      "rva": "0x6A4E28",
+      "text": "window",
+      "_doc": "Widget factory Type string (constructs BorderedWindow)."
+    },
+    "UiType_windowframe": {
+      "rva": "0x6A4E30",
+      "text": "windowframe",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_listbox": {
+      "rva": "0x6A4E40",
+      "text": "listbox",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_tabbedpanel": {
+      "rva": "0x6A4E48",
+      "text": "tabbedpanel",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_sliderbar": {
+      "rva": "0x6A4E58",
+      "text": "sliderbar",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_dropdownmenu": {
+      "rva": "0x6A4E68",
+      "text": "dropdownmenu",
+      "_doc": "Widget factory Type string."
+    },
+    "UiType_graph": {
+      "rva": "0x6DAFCC",
+      "text": "graph",
+      "_doc": "Widget factory Type string ('graph'; note a second short 'graph' literal exists in the image)."
+    },
+    "Ui_invalid_style": {
+      "rva": "0x6A4EF0",
+      "text": "Error: invalid style %s used on control %s",
+      "_doc": "Emitted by the control factory when a Style not present in ui/styles.lua is requested."
+    },
+    "Ui_serialize_ScriptX": {
+      "rva": "0x6A5630",
+      "text": "%sScriptX = \"%s\",\n",
+      "_doc": "Serializer format used when dumping a control tree back to Lua (ScriptX/Y/W/H follow)."
+    },
+    "ScreenW": {
+      "rva": "0x71F620",
+      "text": "ScreenW",
+      "_doc": "Lua global (ScreenW) injected into each screen's state by Ui_BuildFromLua; frame width."
+    },
+    "ScreenH": {
+      "rva": "0x71F628",
+      "text": "ScreenH",
+      "_doc": "Lua global (ScreenH) injected into each screen's state; frame height."
+    },
+    "UiStylesLua": {
+      "rva": "0x6DE848",
+      "text": "ui/styles.lua",
+      "_doc": "Style table (Styles + Normal/Heading/Title/... definitions) loaded for the UI."
+    },
+    "UiLayoutLua": {
+      "rva": "0x6DE838",
+      "text": "ui/layout.lua",
+      "_doc": "Layout constants (DefaultScale, MiddleX, Margin, Title, MainPanel, Buttons) loaded for the UI."
+    },
+    "UiSpritesLua": {
+      "rva": "0x6DE128",
+      "text": "ui/uisprites.lua",
+      "_doc": "Sprite/animated-texture definitions (Sprites table) loaded for the UI."
+    },
+    "UiHudScreen": {
+      "rva": "0x707938",
+      "text": "ui/screens/hud.lua",
+      "_doc": "HUD screen definition (the in-match control tree)."
+    },
+    "UiStartupScreen": {
+      "rva": "0x6DF0A8",
+      "text": "ui/screens/startup.lua",
+      "_doc": "Startup screen definition; loaded by the startup path."
+    }
+  },
+  "globals": {
+    "World_ptr": { "rva": "0x7DE2E0", "type": "ptr", "_doc": "Pointer to the current World." },
+    "World_ptr2": {
+      "rva": "0x7DC440",
+      "type": "ptr",
+      "_doc": "Secondary pointer to the current World."
+    },
+    "SimFrame": {
+      "rva": "0x7DCAF4",
+      "type": "u32",
+      "_doc": "Current simulation frame (u32)."
+    },
+    "SimFrame2": {
+      "rva": "0x7CBA40",
+      "type": "u32",
+      "_doc": "Current simulation frame (u32), second copy."
+    },
+    "Renderer_vtable": {
+      "rva": "0x7D40C0",
+      "type": "ptr",
+      "_doc": "OpenGL renderer vtable base (built at runtime by renderer init). Slot +0x8 is Renderer_Present."
+    },
+    "InputManager_ptr": {
+      "rva": "0x7DEC00",
+      "type": "ptr",
+      "_doc": "Global InputManager* polled by Input_Update every frame."
+    },
+    "Shell_ptr": {
+      "rva": "0x7DBCB0",
+      "type": "ptr",
+      "_doc": "Global FortsShell* (app object; primary vtable FortsShell_Primary)."
+    },
+    "Forts_hwnd": {
+      "rva": "0x7D4388",
+      "type": "ptr",
+      "_doc": "Main window HWND used by Renderer_Present (GetDC/SwapBuffers)."
+    },
+    "ScriptList": {
+      "rva": "0x7DE2E8",
+      "type": "ptr",
+      "_doc": "Pointer to the global std::vector<ScriptRecord> (load order; {begin,end,cap} at +0/+8/+16). Every event dispatcher iterates it. See structs.script_record."
+    },
+    "ScriptContextQueue": {
+      "rva": "0x7DE2F0",
+      "type": "ptr",
+      "_doc": "The ScriptContext queue (std::vector<ScriptRecord>, max depth 10); pushed by Script_ContextPush so GetCurrentScript/GetCurrentCall know the current script and event."
+    },
+    "CurrentScriptName": {
+      "rva": "0x7DD5C0",
+      "type": "ptr",
+      "_doc": "const char* of the event currently being dispatched (set by Script_ContextPush), e.g. \"Update\", \"SystemUpdate\", \"OnUpdate\"."
+    },
+    "LuaCurrentState": {
+      "rva": "0x7DE358",
+      "type": "ptr",
+      "_doc": "The lua_State currently executing (used by Script_Dofile and the binding trampolines). The per-script state is also ScriptRecord+0x08. Lua 5.1.1 (PUC-Rio) is statically linked."
+    },
+    "UiManager_ptr": {
+      "rva": "0x7DEBF8",
+      "type": "ptr",
+      "_doc": "UI/display manager singleton. Its +0x28 points at a display object that owns the win32 HWND and the GetClientRect-derived client size (width/height as i32 at +0x48/+0x4C, as f32 at +0x6C/+0x70, and a flag at +0x7C). Root for the Lua UI functions and the design-canvas centring."
+    },
+    "UiActiveScreen": {
+      "rva": "0x7DD5D8",
+      "type": "u32",
+      "_doc": "Selector for the screen the Lua UI functions operate on (0 = the HUD/match screen, 1/2 = front-end screens). Read by every Ui_* Lua binding; written when the active screen changes."
+    },
+    "UiFlags": {
+      "rva": "0x7DD5CC",
+      "type": "u32",
+      "_doc": "UI activity flags. The Ui_* Lua bindings early-out unless bit 0x2 is set, so UI edits only apply while a UI screen is live."
+    },
+    "LuaBindingMode": {
+      "rva": "0x7DD684",
+      "type": "u8",
+      "_doc": "Lua_RegisterApi binding mode: 0 binds each public API name directly; nonzero binds the '_Name' form and additionally auto-generates a Lua LogCall wrapper (see LogWrapperTemplate)."
+    }
+  },
+  "structs": {
+    "world": {
+      "name": "World",
+      "size": "0x1D18",
+      "_doc": "World layout.",
+      "fields": [
+        {
+          "name": "engine",
+          "offset": "0x8",
+          "type": "ptr",
+          "_doc": "Owner Engine."
+        },
+        {
+          "name": "config",
+          "offset": "0x140",
+          "type": "ptr",
+          "_doc": "Configuration object."
+        },
+        {
+          "name": "flag_0f33",
+          "offset": "0xF33",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "flag_0f34",
+          "offset": "0xF34",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "flag_0f35",
+          "offset": "0xF35",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "hide_forts_during_truce",
+          "offset": "0xF36",
+          "type": "u8",
+          "_doc": "Hide forts while a truce is active."
+        },
+        {
+          "name": "symmetrical",
+          "offset": "0xF38",
+          "type": "bool",
+          "_doc": "Symmetrical map flag."
+        },
+        {
+          "name": "disable_human_assist",
+          "offset": "0xF39",
+          "type": "bool",
+          "_doc": "Disable human assistance."
+        },
+        {
+          "name": "capture",
+          "offset": "0xF3A",
+          "type": "bool",
+          "_doc": "Capture mode flag."
+        },
+        {
+          "name": "value_0f3c",
+          "offset": "0xF3C",
+          "type": "i32",
+          "_doc": "Unknown integer."
+        },
+        {
+          "name": "ai_difficulty",
+          "offset": "0xF40",
+          "type": "i32",
+          "_doc": "AI difficulty."
+        },
+        {
+          "name": "value_0f44",
+          "offset": "0xF44",
+          "type": "i32",
+          "_doc": "Unknown integer."
+        },
+        {
+          "name": "ai_mode",
+          "offset": "0xF48",
+          "type": "i32",
+          "_doc": "AI mode."
+        },
+        {
+          "name": "value_0f4c",
+          "offset": "0xF4C",
+          "type": "i32",
+          "_doc": "Unknown integer."
+        },
+        {
+          "name": "map_path",
+          "offset": "0x10CC",
+          "type": "str",
+          "count": 260,
+          "_doc": "Map file path."
+        },
+        {
+          "name": "map_aux_path",
+          "offset": "0x11D0",
+          "type": "str",
+          "count": 260,
+          "_doc": "Auxiliary map path."
+        },
+        {
+          "name": "mission_name",
+          "offset": "0x12D4",
+          "type": "str",
+          "count": 260,
+          "_doc": "Mission/system name."
+        },
+        {
+          "name": "game_mode",
+          "offset": "0x1B64",
+          "type": "i32",
+          "_doc": "Game mode id."
+        },
+        {
+          "name": "teams",
+          "offset": "0x1CA0",
+          "type": "ptr",
+          "_doc": "Teams container."
+        },
+        {
+          "name": "manager_1ca8",
+          "offset": "0x1CA8",
+          "type": "ptr",
+          "_doc": "Manager."
+        },
+        {
+          "name": "sim",
+          "offset": "0x1CB0",
+          "type": "ptr",
+          "_doc": "Owned WorldSim."
+        },
+        {
+          "name": "terrain",
+          "offset": "0x1CC0",
+          "type": "ptr",
+          "_doc": "Owned TerrainManager (structs.terrain), constructed by World_ctor (call FUN_1401fb780) right after the sim; holds the resolved global Physics.Gravity/Physics.AirDrag and the world extent. Verified live: gravity 981, air_drag 0.4."
+        },
+        {
+          "name": "match_manager",
+          "offset": "0x1CE0",
+          "type": "ptr",
+          "_doc": "World+0x1CE0 = the PlayerController (structs.playercontroller, size 0xF50; built by PlayerController_ctor). Despite the legacy name it is the per-player controller; its +0x47 byte is the DebugPanel overlay gate and its +0xE10 field is the HUD (structs.hud)."
+        },
+        {
+          "name": "client",
+          "offset": "0x1CF8",
+          "type": "ptr",
+          "_doc": "Client."
+        },
+        {
+          "name": "manager_1d00",
+          "offset": "0x1D00",
+          "type": "ptr",
+          "_doc": "Manager."
+        },
+        {
+          "name": "manager_1d08",
+          "offset": "0x1D08",
+          "type": "ptr",
+          "_doc": "Manager."
+        },
+        {
+          "name": "manager_1d10",
+          "offset": "0x1D10",
+          "type": "ptr",
+          "_doc": "Manager."
+        }
+      ]
+    },
+    "match_setup": {
+      "name": "MatchSetup",
+      "size": "0x5A4",
+      "_doc": "Match configuration passed to the World constructor.",
+      "fields": [
+        {
+          "name": "kind",
+          "offset": "0x000",
+          "type": "i32",
+          "_doc": "Setup kind discriminator."
+        },
+        {
+          "name": "timestamp",
+          "offset": "0x004",
+          "type": "str",
+          "count": 16,
+          "_doc": "Timestamp string."
+        },
+        {
+          "name": "map_path",
+          "offset": "0x014",
+          "type": "str",
+          "count": 260,
+          "_doc": "Map file path."
+        },
+        {
+          "name": "map_aux_path",
+          "offset": "0x118",
+          "type": "str",
+          "count": 260,
+          "_doc": "Auxiliary map path."
+        },
+        {
+          "name": "map_id",
+          "offset": "0x21C",
+          "type": "str",
+          "count": 5,
+          "_doc": "Short map id."
+        },
+        {
+          "name": "map_name",
+          "offset": "0x221",
+          "type": "str",
+          "count": 255,
+          "_doc": "Map display name."
+        },
+        {
+          "name": "mission_name",
+          "offset": "0x320",
+          "type": "str",
+          "count": 260,
+          "_doc": "Mission/system name."
+        },
+        {
+          "name": "commander1",
+          "offset": "0x424",
+          "type": "str",
+          "count": 32,
+          "_doc": "First commander name."
+        },
+        {
+          "name": "commander2",
+          "offset": "0x444",
+          "type": "str",
+          "count": 32,
+          "_doc": "Second commander name."
+        },
+        {
+          "name": "id_string",
+          "offset": "0x464",
+          "type": "str",
+          "count": 260,
+          "_doc": "Match identifier string."
+        },
+        {
+          "name": "game_mode_flag",
+          "offset": "0x568",
+          "type": "i32",
+          "_doc": "Game mode flag."
+        },
+        {
+          "name": "ai_mode",
+          "offset": "0x56C",
+          "type": "i32",
+          "_doc": "AI mode."
+        },
+        {
+          "name": "team_config",
+          "offset": "0x570",
+          "type": "i32",
+          "_doc": "Team configuration."
+        },
+        {
+          "name": "difficulty",
+          "offset": "0x574",
+          "type": "i32",
+          "_doc": "Difficulty."
+        },
+        {
+          "name": "param_578",
+          "offset": "0x578",
+          "type": "i32",
+          "_doc": "Unknown parameter."
+        },
+        {
+          "name": "flag_57c",
+          "offset": "0x57C",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "flag_57d",
+          "offset": "0x57D",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "flag_57e",
+          "offset": "0x57E",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "flag_57f",
+          "offset": "0x57F",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "reserved_580",
+          "offset": "0x580",
+          "type": "u8",
+          "_doc": "Reserved."
+        },
+        {
+          "name": "flag_581",
+          "offset": "0x581",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "flag_582",
+          "offset": "0x582",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "flag_583",
+          "offset": "0x583",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "flag_584",
+          "offset": "0x584",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "flag_585",
+          "offset": "0x585",
+          "type": "u8",
+          "_doc": "Unknown flag."
+        },
+        {
+          "name": "mods",
+          "offset": "0x588",
+          "type": "std_vector",
+          "_doc": "Enabled mods vector."
+        },
+        {
+          "name": "param_5a0",
+          "offset": "0x5A0",
+          "type": "i32",
+          "_doc": "Unknown parameter."
+        }
+      ]
+    },
+    "sim": {
+      "name": "WorldSim",
+      "size": "0x19E0",
+      "_doc": "WorldSim layout.",
+      "fields": [
+        {
+          "name": "back_ptr",
+          "offset": "0x8",
+          "type": "ptr",
+          "_doc": "Back-pointer to the owning World."
+        },
+        {
+          "name": "temp_bracing_duration",
+          "offset": "0x4C",
+          "type": "f32",
+          "_doc": "Resolved Physics.TempBracing.Duration (seconds). Verified live: 16."
+        },
+        {
+          "name": "threaded",
+          "offset": "0x80",
+          "type": "bool",
+          "_doc": "Resolved Physics.Threaded: nonzero when the physics workers are used. Verified live: 1."
+        },
+        {
+          "name": "oversamples",
+          "offset": "0x1104",
+          "type": "u32",
+          "_doc": "Resolved Physics.Oversamples. Verified live: 14."
+        },
+        {
+          "name": "minimum_mass",
+          "offset": "0x1108",
+          "type": "f32",
+          "_doc": "Resolved Physics.MinimumMass. Verified live: 15."
+        },
+        {
+          "name": "temp_bracing_fade_duration",
+          "offset": "0x110C",
+          "type": "f32",
+          "_doc": "Resolved Physics.TempBracing.FadeDuration (seconds)."
+        },
+        {
+          "name": "angle_stress_primary",
+          "offset": "0x1114",
+          "type": "f32",
+          "_doc": "Resolved Physics.Limits.AngleStressPrimaryThreshold, converted to radians in the ctor. Verified live: 0.5236 (30 deg)."
+        },
+        {
+          "name": "angle_stress_secondary",
+          "offset": "0x1118",
+          "type": "f32",
+          "_doc": "Resolved Physics.Limits.AngleStressSecondaryThreshold (radians). Verified live: 0.2618 (15 deg)."
+        },
+        {
+          "name": "allowed_foreground_strut_overlap_angle",
+          "offset": "0x111C",
+          "type": "f32",
+          "_doc": "Resolved Physics.Limits.AllowedForegroundStrutDeviceOverlapAngle (radians)."
+        },
+        {
+          "name": "min_strut_divergence_angle",
+          "offset": "0x1120",
+          "type": "f32",
+          "_doc": "Resolved Physics.Limits.MinimumStrutDivergenceAngle (radians). Verified live: 0.2618 (15 deg)."
+        },
+        {
+          "name": "stress_warning_compression_threshold",
+          "offset": "0x1124",
+          "type": "f32",
+          "_doc": "Resolved Physics.StressWarning.CompressionThreshold."
+        },
+        {
+          "name": "stress_warning_expansion_threshold",
+          "offset": "0x1128",
+          "type": "f32",
+          "_doc": "Resolved Physics.StressWarning.ExpansionThreshold."
+        },
+        {
+          "name": "device_max_up_angle",
+          "offset": "0x112C",
+          "type": "f32",
+          "_doc": "Resolved Physics.Limits.DeviceMaxUpAngle."
+        },
+        {
+          "name": "structure_selection_zoom",
+          "offset": "0x1130",
+          "type": "f32",
+          "_doc": "Resolved Physics.Thresholds.StructureSelectionZoom."
+        },
+        {
+          "name": "detailed_structure_zoom",
+          "offset": "0x1134",
+          "type": "f32",
+          "_doc": "Resolved Physics.Thresholds.DetailedStructureZoom."
+        },
+        {
+          "name": "motion_snap_debug",
+          "offset": "0x1138",
+          "type": "bool",
+          "_doc": "Resolved Physics.MotionSnap.Debug."
+        },
+        {
+          "name": "motion_snap_speed_min",
+          "offset": "0x113C",
+          "type": "f32",
+          "_doc": "Resolved Physics.MotionSnap.SpeedMin."
+        },
+        {
+          "name": "motion_snap_speed_cap",
+          "offset": "0x1140",
+          "type": "f32",
+          "_doc": "Resolved Physics.MotionSnap.SpeedCap."
+        },
+        {
+          "name": "motion_snap_delay",
+          "offset": "0x1144",
+          "type": "f32",
+          "_doc": "Resolved Physics.MotionSnap.Delay."
+        },
+        {
+          "name": "node_snap_neutral_bias",
+          "offset": "0x1148",
+          "type": "f32",
+          "_doc": "Resolved Physics.Thresholds.NodeSnapNeutralBias. Verified live: 1.3."
+        },
+        {
+          "name": "link_snap",
+          "offset": "0x114C",
+          "type": "f32",
+          "_doc": "Resolved Physics.Thresholds.LinkSnap. Verified live: 50."
+        },
+        {
+          "name": "link_midpoint_snap",
+          "offset": "0x1150",
+          "type": "f32",
+          "_doc": "Resolved Physics.Thresholds.LinkMidpointSnap."
+        },
+        {
+          "name": "link_extent_snap",
+          "offset": "0x1154",
+          "type": "f32",
+          "_doc": "Resolved Physics.Thresholds.LinkExtentSnap."
+        },
+        {
+          "name": "link_construction_alpha",
+          "offset": "0x1158",
+          "type": "f32",
+          "_doc": "Resolved Physics.Colours.LinkConstructionAlpha."
+        },
+        {
+          "name": "link_replacement_alpha",
+          "offset": "0x115C",
+          "type": "f32",
+          "_doc": "Resolved Physics.Colours.LinkReplacementAlpha."
+        },
+        {
+          "name": "link_warm_up_alpha",
+          "offset": "0x1160",
+          "type": "f32",
+          "_doc": "Resolved Physics.Colours.LinkWarmUpAlpha."
+        },
+        {
+          "name": "link_foundation_test_offset",
+          "offset": "0x1164",
+          "type": "f32",
+          "_doc": "Resolved Physics.mLinkFoundationTestOffset."
+        },
+        {
+          "name": "projectile_recoil_factor",
+          "offset": "0x116C",
+          "type": "f32",
+          "_doc": "Resolved Physics.ProjectileRecoilFactor. Verified live: 1."
+        },
+        {
+          "name": "projectile_tail_factor",
+          "offset": "0x1174",
+          "type": "f32",
+          "_doc": "Resolved View.ProjectileTailFactor."
+        },
+        {
+          "name": "projectile_terminal_velocity_force_threshold",
+          "offset": "0x1178",
+          "type": "f32",
+          "_doc": "Resolved Physics.Limits.ProjectileTerminalVelocityForceThreshold, stored squared."
+        },
+        {
+          "name": "projectile_terminal_velocity_fade_duration",
+          "offset": "0x117C",
+          "type": "f32",
+          "_doc": "Resolved Physics.Limits.ProjectileTerminalVelocityFadeDuration."
+        },
+        {
+          "name": "world_bounds_skirt",
+          "offset": "0x1184",
+          "type": "f32",
+          "_doc": "Resolved Physics.Thresholds.WorldBoundsSkirt."
+        },
+        {
+          "name": "debris_cleanup",
+          "offset": "0x118C",
+          "type": "bool",
+          "_doc": "Resolved DebrisCleanup."
+        },
+        {
+          "name": "debris_cleanup_probability",
+          "offset": "0x1190",
+          "type": "i32",
+          "_doc": "Resolved Physics.Debris.CleanupProbability."
+        },
+        {
+          "name": "debris_max_node_count",
+          "offset": "0x1194",
+          "type": "i32",
+          "_doc": "Resolved Physics.Debris.MaxNodeCount."
+        },
+        {
+          "name": "max_beam_reflections",
+          "offset": "0x1198",
+          "type": "i32",
+          "_doc": "Resolved Physics.MaxBeamReflections."
+        },
+        {
+          "name": "max_missile_ray_casts",
+          "offset": "0x119C",
+          "type": "i32",
+          "_doc": "Resolved Physics.MaxMissileRayCasts."
+        },
+        {
+          "name": "missile_turn_clearance",
+          "offset": "0x11A0",
+          "type": "f32",
+          "_doc": "Resolved Physics.MissileTurnClearance."
+        },
+        {
+          "name": "missile_turn_target_offset",
+          "offset": "0x11A4",
+          "type": "f32",
+          "_doc": "Resolved Physics.MissileTurnTargetOffset."
+        },
+        {
+          "name": "missile_turn_clearance_min",
+          "offset": "0x11A8",
+          "type": "f32",
+          "_doc": "Resolved Physics.MissileTurnClearanceMinimum."
+        },
+        {
+          "name": "all_nodes_fixed",
+          "offset": "0x11DA",
+          "type": "bool",
+          "_doc": "Resolved Physics.AllNodesFixed. Verified live: 0."
+        },
+        {
+          "name": "shock_mass_loss_threshold",
+          "offset": "0x1260",
+          "type": "f32",
+          "_doc": "Resolved Physics.Shock.MassLossThreshold."
+        },
+        {
+          "name": "shock_filter_taps",
+          "offset": "0x1264",
+          "type": "i32",
+          "_doc": "Resolved Physics.Shock.FilterTaps."
+        },
+        {
+          "name": "vibration_drip",
+          "offset": "0x127C",
+          "type": "f32",
+          "_doc": "Resolved Physics.Vibration.Drip."
+        },
+        {
+          "name": "vibration_leak",
+          "offset": "0x1280",
+          "type": "f32",
+          "_doc": "Resolved Physics.Vibration.Leak."
+        },
+        {
+          "name": "vibration_capacity",
+          "offset": "0x1284",
+          "type": "f32",
+          "_doc": "Resolved Physics.Vibration.Capacity."
+        },
+        {
+          "name": "terrain_bounce_normal_factor",
+          "offset": "0x1288",
+          "type": "f32",
+          "_doc": "Resolved Physics.TerrainBounce.NormalFactor."
+        },
+        {
+          "name": "terrain_bounce_loss_factor",
+          "offset": "0x128C",
+          "type": "f32",
+          "_doc": "Resolved Physics.TerrainBounce.LossFactor."
+        },
+        {
+          "name": "default_brake_level",
+          "offset": "0x1290",
+          "type": "f32",
+          "_doc": "Resolved Physics.DefaultBrakeLevel."
+        },
+        {
+          "name": "brake_min_speed",
+          "offset": "0x1294",
+          "type": "f32",
+          "_doc": "Resolved Physics.BrakeMinSpeed."
+        },
+        {
+          "name": "terrain_bounce_effect_velocity_threshold",
+          "offset": "0x1298",
+          "type": "f32",
+          "_doc": "Resolved Physics.TerrainBounce.Effect.VelocityThreshold."
+        },
+        {
+          "name": "terrain_bounce_effect_mass_threshold",
+          "offset": "0x129C",
+          "type": "f32",
+          "_doc": "Resolved Physics.TerrainBounce.Effect.MassThreshold."
+        },
+        {
+          "name": "min_stiffness",
+          "offset": "0x12A0",
+          "type": "f32",
+          "_doc": "Resolved Physics.MinStiffness. Verified live: 10000."
+        },
+        {
+          "name": "max_stiffness",
+          "offset": "0x12A4",
+          "type": "f32",
+          "_doc": "Resolved Physics.MaxStiffness. Verified live: 1000000."
+        },
+        {
+          "name": "physics_log_level_threads",
+          "offset": "0x12AC",
+          "type": "i32",
+          "_doc": "Resolved Physics.LogLevelThreads."
+        },
+        {
+          "name": "water_force",
+          "offset": "0x12B0",
+          "type": "f32",
+          "_doc": "Resolved Physics.Water.Force. Verified live: 1."
+        },
+        {
+          "name": "water_force_neutral",
+          "offset": "0x12B4",
+          "type": "f32",
+          "_doc": "Resolved Physics.Water.ForceNeutral."
+        },
+        {
+          "name": "water_power",
+          "offset": "0x12B8",
+          "type": "f32",
+          "_doc": "Resolved Physics.Water.Power."
+        },
+        {
+          "name": "water_max_depth",
+          "offset": "0x12BC",
+          "type": "f32",
+          "_doc": "Resolved Physics.Water.MaxDepth. Verified live: 500."
+        },
+        {
+          "name": "water_drag",
+          "offset": "0x12C0",
+          "type": "f32",
+          "_doc": "Resolved Physics.Water.Drag. Verified live: 50."
+        },
+        {
+          "name": "water_fill_rate",
+          "offset": "0x12C8",
+          "type": "f32",
+          "_doc": "1.0 / resolved Physics.Water.FillPeriod."
+        },
+        {
+          "name": "water_drain_rate",
+          "offset": "0x12CC",
+          "type": "f32",
+          "_doc": "1.0 / resolved Physics.Water.DrainPeriod."
+        },
+        {
+          "name": "buildable_glow_period",
+          "offset": "0x12D4",
+          "type": "f32",
+          "_doc": "Resolved Physics.BuildableGlow.Period."
+        },
+        {
+          "name": "buildable_glow_min_alpha",
+          "offset": "0x12D8",
+          "type": "f32",
+          "_doc": "Resolved Physics.BuildableGlow.MinAlpha."
+        },
+        {
+          "name": "buildable_glow_offset_factor",
+          "offset": "0x12DC",
+          "type": "f32",
+          "_doc": "Resolved Physics.BuildableGlow.OffsetFactor."
+        },
+        {
+          "name": "buildable_glow_width",
+          "offset": "0x12E0",
+          "type": "f32",
+          "_doc": "Resolved Physics.BuildableGlow.Width."
+        },
+        {
+          "name": "fixed_timestep",
+          "offset": "0x1860",
+          "type": "f32",
+          "_doc": "Fixed timestep in seconds (0.04 = 25 Hz)."
+        },
+        {
+          "name": "frame_batch_a",
+          "offset": "0x1864",
+          "type": "i32",
+          "_doc": "Frame batch counter."
+        },
+        {
+          "name": "frame_batch_b",
+          "offset": "0x1868",
+          "type": "i32",
+          "_doc": "Resolved Physics.TickLookahead. Verified live: 1."
+        },
+        {
+          "name": "collision_lookahead_distance",
+          "offset": "0x1874",
+          "type": "f32",
+          "_doc": "Resolved Physics.CollisionLookaheadDistance. Verified live: 2."
+        },
+        {
+          "name": "collision_structure_over_device_bias",
+          "offset": "0x1878",
+          "type": "f32",
+          "_doc": "Resolved Physics.CollisionStructureOverDeviceBias. Verified live: 20."
+        },
+        {
+          "name": "accumulated",
+          "offset": "0x18AC",
+          "type": "f32",
+          "_doc": "Accumulated fixed-step time."
+        },
+        {
+          "name": "alpha",
+          "offset": "0x18B4",
+          "type": "f32",
+          "_doc": "Interpolation alpha."
+        },
+        {
+          "name": "frame_counter",
+          "offset": "0x18B8",
+          "type": "u32",
+          "_doc": "Frame counter."
+        },
+        {
+          "name": "clock",
+          "offset": "0x18C0",
+          "type": "embedded",
+          "struct": "software_time_keeper",
+          "_doc": "Inline SoftwareTimeKeeper (structs.software_time_keeper). NOT a pointer: the object itself begins here and its vptr is the first 8 bytes. The tick reads/writes its time via SoftwareTimeKeeper_Get/_Set."
+        },
+        {
+          "name": "pending_list",
+          "offset": "0x1960",
+          "type": "ptr",
+          "_doc": "Pending list."
+        }
+      ]
+    },
+    "input": {
+      "name": "InputManager",
+      "size": "0xC00",
+      "_doc": "DirectInput8 + Win32 input manager (global InputManager_ptr), polled once per frame by Input_Update. `keyboard_state`/`keyboard_prev` are raw 256-byte DIK scancode arrays (read as bytes, NOT NUL-terminated strings); a mod can read them to listen and zero `keyboard_state` plus the mouse fields inside Input_Update to filter input (e.g. while an overlay captures the mouse).",
+      "fields": [
+        {
+          "name": "keyboard_state",
+          "offset": "0x40",
+          "type": "str",
+          "count": 256,
+          "_doc": "Current keyboard state, 256 DIK scancodes (nonzero = down). Raw byte array; not a C string."
+        },
+        {
+          "name": "keyboard_prev",
+          "offset": "0x140",
+          "type": "str",
+          "count": 256,
+          "_doc": "Previous frame's keyboard state (edge detection copy of keyboard_state). Raw byte array; not a C string."
+        },
+        {
+          "name": "mouse_dx",
+          "offset": "0x240",
+          "type": "i32",
+          "_doc": "Relative mouse X accumulated this frame."
+        },
+        {
+          "name": "mouse_dy",
+          "offset": "0x244",
+          "type": "i32",
+          "_doc": "Relative mouse Y accumulated this frame."
+        },
+        {
+          "name": "mouse_wheel",
+          "offset": "0x248",
+          "type": "i32",
+          "_doc": "Mouse wheel delta this frame."
+        },
+        {
+          "name": "wheel_accum",
+          "offset": "0xB54",
+          "type": "i32",
+          "_doc": "Wheel accumulator fed by WM_MOUSEWHEEL."
+        },
+        {
+          "name": "ime_composing",
+          "offset": "0xBC0",
+          "type": "bool",
+          "_doc": "Set on WM_IME_STARTCOMPOSITION, cleared on WM_IME_ENDCOMPOSITION."
+        }
+      ]
+    },
+    "playercontroller": {
+      "name": "PlayerController",
+      "size": "0xF50",
+      "_doc": "World+0x1CE0. Per-player controller (size 0xF50) built by PlayerController_ctor (FUN_140289e00) from World_ctor. Owns the debug overlay gate and a HUD sub-object.",
+      "fields": [
+        {
+          "name": "debug_overlay",
+          "offset": "0x47",
+          "type": "bool",
+          "_doc": "Debug overlay gate. Set from (World+0x1b64==2), i.e. spectator only. When nonzero, HUD_DebugPanel shows the DebugPanel and fills the DebugListBox with the live debug lines (sim frame, mm:ss, fps, speed 'Nx'). It is re-evaluated every frame, so force this byte to 1 on entry to HUD_Update (or HUD_DebugPanel) to open the overlay in any match."
+        },
+        {
+          "name": "hud",
+          "offset": "0xE10",
+          "type": "ptr",
+          "_doc": "HUD sub-object (structs.hud)."
+        }
+      ]
+    },
+    "hud": {
+      "name": "HUD",
+      "size": "0x14A0",
+      "_doc": "PlayerController+0xE10. Per-controller HUD/control tree. HUD_Update (FUN_140190210) drives it every frame; its +0x40 points back at the owning World. Holds the debug overlay controls.",
+      "fields": [
+        {
+          "name": "world",
+          "offset": "0x40",
+          "type": "ptr",
+          "_doc": "Owner World."
+        },
+        {
+          "name": "debug_panel",
+          "offset": "0x1218",
+          "type": "ptr",
+          "_doc": "DebugPanel control (RTTI class Static)."
+        },
+        {
+          "name": "debug_list",
+          "offset": "0x1220",
+          "type": "ptr",
+          "_doc": "DebugListBox control (RTTI class ListBox)."
+        },
+        {
+          "name": "debug_list_count",
+          "offset": "0x1240",
+          "type": "i32",
+          "_doc": "Number of debug lines currently requested."
+        }
+      ]
+    },
+    "script_record": {
+      "name": "ScriptRecord",
+      "size": "0x90",
+      "_doc": "One entry of the global ScriptList vector (element size 0x90). Holds a script's own lua_State, its source path and the global-table snapshot used to detect state stored outside 'data'. Each record is an independent Lua VM for one script; events are dispatched to every active record by name.",
+      "fields": [
+        {
+          "name": "active",
+          "offset": "0x00",
+          "type": "u32",
+          "_doc": "1 when the script is loaded and should receive Update/SystemUpdate/events."
+        },
+        {
+          "name": "state",
+          "offset": "0x08",
+          "type": "ptr",
+          "_doc": "This script's lua_State*."
+        },
+        {
+          "name": "name",
+          "offset": "0x10",
+          "type": "str",
+          "count": 32,
+          "_doc": "MSVC std::string (SSO buffer at +0x10, size at +0x20, capacity at +0x28) holding the script path, e.g. 'mods/dlc3/script.lua' or 'maps/<map>/<map>.lua'. Raw std::string bytes, not a plain C string."
+        },
+        {
+          "name": "short_name",
+          "offset": "0x30",
+          "type": "str",
+          "count": 32,
+          "_doc": "Second MSVC std::string: the bare script name without path or extension, e.g. 'dlc_harpoon'."
+        },
+        {
+          "name": "global_count",
+          "offset": "0x60",
+          "type": "i32",
+          "_doc": "Global-table count snapshot used by the desync guard in Scripts_Update_Dispatch. A value of -1 means the guard is not armed for that script (neither the ==0 arm nor the >0 compare runs), which is what a normal mod script shows live."
+        }
+      ]
+    },
+    "software_time_keeper": {
+      "name": "SoftwareTimeKeeper",
+      "size": "0x10",
+      "_doc": "Inline simulation clock (RTTI class SoftwareTimeKeeper, base TimeKeeper). Embedded in WorldSim at +0x18C0. Its vptr is written in place by SoftwareTimeKeeper_ctor, so the object lives inside WorldSim rather than on the heap; the WorldSim tick advances its time every fixed step and reads it back for scheduled effects / time-limit checks.",
+      "fields": [
+        {
+          "name": "vptr",
+          "offset": "0x0",
+          "type": "ptr",
+          "_doc": "vtable pointer (SoftwareTimeKeeper_Primary; slot +0x0 = Set, +0x8 = Get)."
+        },
+        {
+          "name": "time",
+          "offset": "0x8",
+          "type": "f32",
+          "_doc": "Simulation time in seconds, advanced by the fixed timestep (set via the vtable Set slot, read via Get)."
+        }
+      ]
+    },
+    "control": {
+      "name": "Control",
+      "size": "0x190",
+      "_doc": "Base UI control of the game's own widget toolkit (factory Type 'Control', alloc 0x190). RTTI hierarchy: Control -> WindowFrame -> StaticWindow -> Static/BorderedWindow; Button/Text/TextButton/EditBox/ListBox/TabbedPanel/SliderBar/DropDownMenu/Graph derive from it. Only the members confirmed through the control-tree helpers (Ui_FindControl / Ui_AddChild) are modelled here; the rest of the 0x190 bytes is unidentified.",
+      "fields": [
+        {
+          "name": "vptr",
+          "offset": "0x0",
+          "type": "ptr",
+          "_doc": "MSVC vptr (per-class vftable)."
+        },
+        {
+          "name": "children",
+          "offset": "0xD0",
+          "type": "std_vector",
+          "_doc": "std::vector<Control*> of child controls (begin/end/cap at +0xD0/+0xD8/+0xE0). Walked by Ui_FindControl, mutated by Ui_AddChild/Ui_AddChildFront."
+        },
+        {
+          "name": "name",
+          "offset": "0x128",
+          "type": "str",
+          "count": 32,
+          "_doc": "MSVC std::string control name (SSO buffer at +0x128, size at +0x138, capacity at +0x140). Matched by Ui_FindControl and by the engine's named-control lookups (e.g. DebugPanel, ResourcePanelEnemy); used as the first argument to the Lua UI functions."
+        },
+        {
+          "name": "flag_148",
+          "offset": "0x148",
+          "type": "u8",
+          "_doc": "Unknown flag. Ui_FindControl only descends into a control's children when this is 0 (or when a recursive lookup was requested), so it gates child lookup/visibility."
+        }
+      ]
+    },
+    "node": {
+      "name": "Node",
+      "size": "0x1C0",
+      "_doc": "A simulation node (forts are graphs of nodes linked by struts). These are the elements of the WorldSim node vector at sim+0x30 (std::vector<Node*>, 8 bytes per slot; slots 0 and 1 are the reserved null/sentinel entries, real nodes start at index 2). This is a PACKED (4-byte) MSVC class, so its pointers and link vector live at 4-mod-8 offsets the field vocabulary cannot express; only the naturally-aligned scalars are modelled here. Verified live against the game's own world-dump: node id, team, mass, drag, x/y/z position, x/y velocity and structure id all match. NodeVelocity/NodePosition/NodeTeam/NodeStructureId in the Lua API read these. `projectile` is a pointer at +0xBC (null unless the node is a projectile); `controller` is a pointer at +0xC4 (the Device/Weapon attached to the node, null otherwise); the link vector is a std::vector<Link> control block at +0xCC/+0xD4/+0xDC with 0x19C-byte packed Link elements.",
+      "fields": [
+        {
+          "name": "node_id",
+          "offset": "0xEC",
+          "type": "u32",
+          "_doc": "Node id used by the Lua API (NodeExists/NodePosition/...). Verified live: matches the 'N%d' line of the world dump."
+        },
+        {
+          "name": "team_id",
+          "offset": "0xF0",
+          "type": "u32",
+          "_doc": "Owning team id (encoded side+team: side = team_id % 100). 0 for a free/neutral node. Verified live."
+        },
+        {
+          "name": "mass",
+          "offset": "0xF8",
+          "type": "f32",
+          "_doc": "Node mass in kg (world dump 'Mass'). Verified live."
+        },
+        {
+          "name": "drag",
+          "offset": "0xFC",
+          "type": "f32",
+          "_doc": "Per-node air drag (world dump 'Drag'; scaled by Physics.AirDrag). Verified live."
+        },
+        {
+          "name": "position_x",
+          "offset": "0x100",
+          "type": "f32",
+          "_doc": "World position X (float; Lua NodePosition). Verified live."
+        },
+        {
+          "name": "position_y",
+          "offset": "0x104",
+          "type": "f32",
+          "_doc": "World position Y (float; Lua NodePosition). Verified live."
+        },
+        {
+          "name": "position_z",
+          "offset": "0x108",
+          "type": "f32",
+          "_doc": "World position Z (float; Lua NodePosition). Verified live."
+        },
+        {
+          "name": "velocity_x",
+          "offset": "0x10C",
+          "type": "f32",
+          "_doc": "Velocity X (float; Lua NodeVelocity). Verified live."
+        },
+        {
+          "name": "velocity_y",
+          "offset": "0x110",
+          "type": "f32",
+          "_doc": "Velocity Y (float; Lua NodeVelocity). Verified live."
+        },
+        {
+          "name": "velocity_z",
+          "offset": "0x114",
+          "type": "f32",
+          "_doc": "Velocity Z (float; Lua NodeVelocity)."
+        },
+        {
+          "name": "structure_id",
+          "offset": "0x124",
+          "type": "i32",
+          "_doc": "Structure this node belongs to (Lua NodeStructureId / GetStructureId). -1 when unassigned. Verified live."
+        },
+        {
+          "name": "prev_position_x",
+          "offset": "0x128",
+          "type": "f32",
+          "_doc": "Position X at the previous step (world dump 'Prev'). Verified live."
+        },
+        {
+          "name": "prev_position_y",
+          "offset": "0x12C",
+          "type": "f32",
+          "_doc": "Position Y at the previous step (world dump 'Prev'). Verified live."
+        }
+      ]
+    },
+    "terrain": {
+      "name": "TerrainManager",
+      "size": "0xA08",
+      "_doc": "World+0x1CC0. Terrain + global physics-constant holder, built by World_ctor via its ctor FUN_1401fb780, which reads the config registry (config object = World+0x140) for the 'Physics.*' constants and caches the resolved values here. Read these to inspect the live physics tuning (Lua GetConstant('Physics.Gravity')). Verified live.",
+      "fields": [
+        {
+          "name": "world_extent_neg",
+          "offset": "0x9D8",
+          "type": "f32",
+          "_doc": "Negated Terrain.Limits.World (from the ctor)."
+        },
+        {
+          "name": "world_extent_pos",
+          "offset": "0x9DC",
+          "type": "f32",
+          "_doc": "Terrain.Limits.World extent (from the ctor)."
+        },
+        {
+          "name": "gravity",
+          "offset": "0x9F4",
+          "type": "f32",
+          "_doc": "Resolved Physics.Gravity (vertical force, positive down; default 982.4). Verified live: 981."
+        },
+        {
+          "name": "air_drag",
+          "offset": "0x9FC",
+          "type": "f32",
+          "_doc": "Resolved Physics.AirDrag (default 0.6). Verified live: 0.4."
+        }
+      ]
+    }
+  }
+}
